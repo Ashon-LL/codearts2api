@@ -821,6 +821,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if serr != nil {
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
+			var serrAE *upstream.ApiError
+			if errors.As(serr, &serrAE) && isParamInvalidError(serrAE) {
+				// Client request-param problem: rotating accounts yields the same 400,
+				// and cooling accounts takes down the whole pool for minutes.
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+					"upstream rejected request params: "+truncateMsg(serr.Error(), 200))
+				return
+			}
 			lastErr = serr
 			if h.handleUpstreamError(acct, model, serr) {
 				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
@@ -988,7 +996,11 @@ func nativeToolChoice(choice toolChoiceOpenAI) any {
 	case "none", "required":
 		return choice.Mode
 	case "function":
-		return map[string]any{"type": "function", "function": map[string]any{"name": choice.Function}}
+		// CodeArts InferHub only accepts string-form tool_choice; the object form
+		// is rejected with InferHub.001001005.400 param invalid (measured 2026-10-06).
+		// Map function mode to "required": keep the must-call-tool semantics and
+		// let the model pick which tool (equivalent to forcing with one tool).
+		return "required"
 	default:
 		return "auto"
 	}
@@ -1084,6 +1096,16 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 	}
 	h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 	return false
+}
+
+// isParamInvalidError 判断是否为上游「请求参数无效」类错误（InferHub.001001005）。
+// 这类错误是客户端请求形状问题：换账号结果相同，绝不能冷却账号（曾因此打停整池）。
+func isParamInvalidError(err *upstream.ApiError) bool {
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Message)
+	return strings.Contains(low, "inferhub.001001005") || strings.Contains(low, "request param is invalid")
 }
 
 // isConcurrentLimitError 判断是否为上游并发会话上限错误（瞬时、可重试）。
